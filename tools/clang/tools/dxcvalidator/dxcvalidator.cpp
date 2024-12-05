@@ -9,13 +9,14 @@
 //                                                                           //
 ///////////////////////////////////////////////////////////////////////////////
 
+#include "dxc/Support/WinIncludes.h"
 #include "llvm/Bitcode/ReaderWriter.h"
 #include "llvm/IR/DiagnosticPrinter.h"
 #include "llvm/IR/LLVMContext.h"
 
 #include "dxc/DxilContainer/DxilContainer.h"
-#include "dxc/HLSL/DxilValidation.h"
-#include "dxc/Support/WinIncludes.h"
+#include "dxc/DxilHash/DxilHash.h"
+#include "dxc/DxilValidation/DxilValidation.h"
 #include "dxc/dxcapi.h"
 #include "dxcvalidator.h"
 
@@ -31,29 +32,39 @@
 using namespace llvm;
 using namespace hlsl;
 
-// Utility class for setting and restoring the diagnostic context so we may
-// capture errors/warnings
-struct DiagRestore {
-  LLVMContext &Ctx;
-  void *OrigDiagContext;
-  LLVMContext::DiagnosticHandlerTy OrigHandler;
+static void HashAndUpdate(DxilContainerHeader *Container) {
+  // Compute hash and update stored hash.
+  // Hash the container from this offset to the end.
+  static const uint32_t DXBCHashStartOffset =
+      offsetof(struct DxilContainerHeader, Version);
+  const unsigned char *DataToHash =
+      (const unsigned char *)Container + DXBCHashStartOffset;
+  unsigned AmountToHash = Container->ContainerSizeInBytes - DXBCHashStartOffset;
+  ComputeHashRetail(DataToHash, AmountToHash, Container->Hash.Digest);
+}
 
-  DiagRestore(llvm::LLVMContext &Ctx, void *DiagContext) : Ctx(Ctx) {
-    OrigHandler = Ctx.getDiagnosticHandler();
-    OrigDiagContext = Ctx.getDiagnosticContext();
-    Ctx.setDiagnosticHandler(PrintDiagnosticContext::PrintDiagnosticHandler,
-                             DiagContext);
+static void HashAndUpdateOrCopy(uint32_t Flags, IDxcBlob *Shader,
+                                IDxcBlob **Hashed) {
+  if (Flags & DxcValidatorFlags_InPlaceEdit) {
+    HashAndUpdate((DxilContainerHeader *)Shader->GetBufferPointer());
+    *Hashed = Shader;
+    Shader->AddRef();
+  } else {
+    CComPtr<AbstractMemoryStream> HashedBlobStream;
+    IFT(CreateMemoryStream(DxcGetThreadMallocNoRef(), &HashedBlobStream));
+    unsigned long CB;
+    IFT(HashedBlobStream->Write(Shader->GetBufferPointer(),
+                                Shader->GetBufferSize(), &CB));
+    HashAndUpdate((DxilContainerHeader *)HashedBlobStream->GetPtr());
+    IFT(HashedBlobStream.QueryInterface(Hashed));
   }
-  ~DiagRestore() { Ctx.setDiagnosticHandler(OrigHandler, OrigDiagContext); }
-};
+}
 
 static uint32_t runValidation(
     IDxcBlob *Shader,
     uint32_t Flags,            // Validation flags.
-    llvm::Module *Module,      // Module to validate, if available.
     llvm::Module *DebugModule, // Debug module to validate, if available
     AbstractMemoryStream *DiagMemStream) {
-
   // Run validation may throw, but that indicates an inability to validate,
   // not that the validation failed (eg out of memory). That is indicated
   // by a failing HRESULT, and possibly error messages in the diagnostics
@@ -61,49 +72,9 @@ static uint32_t runValidation(
 
   raw_stream_ostream DiagStream(DiagMemStream);
 
-  if (Flags & DxcValidatorFlags_ModuleOnly) {
-    if (IsDxilContainerLike(Shader->GetBufferPointer(),
-                            Shader->GetBufferSize()))
-      return E_INVALIDARG;
-  } else {
-    if (!IsDxilContainerLike(Shader->GetBufferPointer(),
-                             Shader->GetBufferSize()))
-      return DXC_E_CONTAINER_INVALID;
-  }
-
-  if (!Module) {
-    DXASSERT_NOMSG(DebugModule == nullptr);
-    if (Flags & DxcValidatorFlags_ModuleOnly) {
-      return ValidateDxilBitcode((const char *)Shader->GetBufferPointer(),
-                                 (uint32_t)Shader->GetBufferSize(), DiagStream);
-    } else {
-      return ValidateDxilContainer(Shader->GetBufferPointer(),
-                                   Shader->GetBufferSize(), DiagStream);
-    }
-  }
-
-  llvm::DiagnosticPrinterRawOStream DiagPrinter(DiagStream);
-  PrintDiagnosticContext DiagContext(DiagPrinter);
-  DiagRestore DR(Module->getContext(), &DiagContext);
-
-  HRESULT hr = hlsl::ValidateDxilModule(Module, DebugModule);
-  if (FAILED(hr))
-    return hr;
-  if (!(Flags & DxcValidatorFlags_ModuleOnly)) {
-    hr = ValidateDxilContainerParts(
-        Module, DebugModule,
-        IsDxilContainerLike(Shader->GetBufferPointer(),
-                            Shader->GetBufferSize()),
-        (uint32_t)Shader->GetBufferSize());
-    if (FAILED(hr))
-      return hr;
-  }
-
-  if (DiagContext.HasErrors() || DiagContext.HasWarnings()) {
-    return DXC_E_IR_VERIFICATION_FAILED;
-  }
-
-  return S_OK;
+  return ValidateDxilContainer(Shader->GetBufferPointer(),
+                               Shader->GetBufferSize(), DebugModule,
+                               DiagStream);
 }
 
 static uint32_t
@@ -151,23 +122,14 @@ runRootSignatureValidation(IDxcBlob *Shader,
   return S_OK;
 }
 
-// Compile a single entry point to the target shader model
-uint32_t hlsl::validate(
-    IDxcBlob *Shader,            // Shader to validate.
-    uint32_t Flags,              // Validation flags.
-    IDxcOperationResult **Result // Validation output status, buffer, and errors
-) {
-  DxcThreadMalloc TM(DxcGetThreadMallocNoRef());
-  if (Result == nullptr)
-    return false;
-  *Result = nullptr;
-  if (Shader == nullptr || Flags & ~DxcValidatorFlags_ValidMask)
-    return false;
-  if ((Flags & DxcValidatorFlags_ModuleOnly) &&
-      (Flags &
-       (DxcValidatorFlags_InPlaceEdit | DxcValidatorFlags_RootSignatureOnly)))
-    return false;
-  return validateWithOptModules(Shader, Flags, nullptr, nullptr, Result);
+static uint32_t runDxilModuleValidation(IDxcBlob *Shader, // Shader to validate.
+                                        AbstractMemoryStream *DiagMemStream) {
+  if (IsDxilContainerLike(Shader->GetBufferPointer(), Shader->GetBufferSize()))
+    return E_INVALIDARG;
+
+  raw_stream_ostream DiagStream(DiagMemStream);
+  return ValidateDxilBitcode((const char *)Shader->GetBufferPointer(),
+                             (uint32_t)Shader->GetBufferSize(), DiagStream);
 }
 
 uint32_t hlsl::validateWithDebug(
@@ -212,17 +174,15 @@ uint32_t hlsl::validateWithDebug(
       if (FAILED(hr))
         throw hlsl::Exception(hr);
     }
-    return validateWithOptModules(Shader, Flags, nullptr, DebugModule.get(),
-                                  Result);
+    return validateWithOptDebugModule(Shader, Flags, DebugModule.get(), Result);
   }
   CATCH_CPP_ASSIGN_HRESULT();
   return hr;
 }
 
-uint32_t hlsl::validateWithOptModules(
+uint32_t hlsl::validateWithOptDebugModule(
     IDxcBlob *Shader,            // Shader to validate.
     uint32_t Flags,              // Validation flags.
-    llvm::Module *Module,        // Module to validate, if available.
     llvm::Module *DebugModule,   // Debug module to validate, if available
     IDxcOperationResult **Result // Validation output status, buffer, and errors
 ) {
@@ -238,29 +198,50 @@ uint32_t hlsl::validateWithOptModules(
       throw hlsl::Exception(hr);
     // Run validation may throw, but that indicates an inability to validate,
     // not that the validation failed (eg out of memory).
-    if (Flags & DxcValidatorFlags_RootSignatureOnly) {
+    if (Flags & DxcValidatorFlags_RootSignatureOnly)
       validationStatus = runRootSignatureValidation(Shader, DiagStream);
-    } else {
-      validationStatus =
-          runValidation(Shader, Flags, Module, DebugModule, DiagStream);
-    }
+    else if (Flags & DxcValidatorFlags_ModuleOnly)
+      validationStatus = runDxilModuleValidation(Shader, DiagStream);
+    else
+      validationStatus = runValidation(Shader, Flags, DebugModule, DiagStream);
     if (FAILED(validationStatus)) {
       std::string msg("Validation failed.\n");
       ULONG cbWritten;
       DiagStream->Write(msg.c_str(), msg.size(), &cbWritten);
     }
-    // Assemble the result object.
-    CComPtr<IDxcBlob> pDiagBlob;
-    hr = DiagStream.QueryInterface(&pDiagBlob);
-    DXASSERT_NOMSG(SUCCEEDED(hr));
-    hr = DxcResult::Create(
-        validationStatus, DXC_OUT_NONE,
-        {DxcOutputObject::ErrorOutput(
-            CP_UTF8, // TODO Support DefaultTextCodePage
-            (LPCSTR)pDiagBlob->GetBufferPointer(), pDiagBlob->GetBufferSize())},
-        Result);
-    if (FAILED(hr))
-      throw hlsl::Exception(hr);
+    if (Flags & (DxcValidatorFlags_ModuleOnly)) {
+      // Validating a module only, return DXC_OUT_NONE instead of
+      // DXC_OUT_OBJECT.
+      CComPtr<IDxcBlob> pDiagBlob;
+      hr = DiagStream.QueryInterface(&pDiagBlob);
+      DXASSERT_NOMSG(SUCCEEDED(hr));
+      hr = DxcResult::Create(validationStatus, DXC_OUT_NONE,
+                             {DxcOutputObject::ErrorOutput(
+                                 CP_UTF8, // TODO Support DefaultTextCodePage
+                                 (LPCSTR)pDiagBlob->GetBufferPointer(),
+                                 pDiagBlob->GetBufferSize())},
+                             Result);
+      if (FAILED(hr))
+        throw hlsl::Exception(hr);
+    } else {
+      CComPtr<IDxcBlob> HashedBlob;
+      // Assemble the result object.
+      CComPtr<IDxcBlob> DiagBlob;
+      CComPtr<IDxcBlobEncoding> DiagBlobEnconding;
+      hr = DiagStream.QueryInterface(&DiagBlob);
+      DXASSERT_NOMSG(SUCCEEDED(hr));
+      hr = DxcCreateBlobWithEncodingSet(DiagBlob, CP_UTF8, &DiagBlobEnconding);
+      if (FAILED(hr))
+        throw hlsl::Exception(hr);
+      HashAndUpdateOrCopy(Flags, Shader, &HashedBlob);
+      hr = DxcResult::Create(
+          validationStatus, DXC_OUT_OBJECT,
+          {DxcOutputObject::DataOutput(DXC_OUT_OBJECT, HashedBlob),
+           DxcOutputObject::DataOutput(DXC_OUT_ERRORS, DiagBlobEnconding)},
+          Result);
+      if (FAILED(hr))
+        throw hlsl::Exception(hr);
+    }
   }
   CATCH_CPP_ASSIGN_HRESULT();
 

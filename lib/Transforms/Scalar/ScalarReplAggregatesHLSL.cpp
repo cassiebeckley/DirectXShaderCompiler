@@ -3728,7 +3728,9 @@ static bool ReplaceUseOfZeroInitEntry(Instruction *I, Value *V) {
     // I is the last inst in the block after split.
     // Any inst in current block is before I.
     if (LoadInst *LI = dyn_cast<LoadInst>(UI)) {
-      LI->replaceAllUsesWith(ConstantAggregateZero::get(LI->getType()));
+      // Replace uses of the load with a constant zero.
+      Constant *replacement = Constant::getNullValue(LI->getType());
+      LI->replaceAllUsesWith(replacement);
       LI->eraseFromParent();
       continue;
     }
@@ -5298,7 +5300,9 @@ void SROA_Parameter_HLSL::flattenArgument(
     // Unwrap top-level array if primitive
     if (inputQual == DxilParamInputQual::InputPatch ||
         inputQual == DxilParamInputQual::OutputPatch ||
-        inputQual == DxilParamInputQual::InputPrimitive) {
+        inputQual == DxilParamInputQual::InputPrimitive ||
+        inputQual == DxilParamInputQual::OutPrimitives ||
+        inputQual == DxilParamInputQual::OutVertices) {
       Type *Ty = Arg->getType();
       if (Ty->isPointerTy())
         Ty = Ty->getPointerElementType();

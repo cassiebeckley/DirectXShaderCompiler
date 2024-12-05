@@ -63,6 +63,7 @@
 // SPIRV change starts
 #ifdef ENABLE_SPIRV_CODEGEN
 #include "clang/SPIRV/EmitSpirvAction.h"
+#include "clang/SPIRV/FeatureManager.h"
 #endif
 // SPIRV change ends
 
@@ -76,17 +77,6 @@ using namespace llvm;
 using namespace clang;
 using namespace hlsl;
 using std::string;
-
-// This declaration is used for the locally-linked validator.
-HRESULT CreateDxcValidator(REFIID riid, LPVOID *ppv);
-
-// This internal call allows the validator to avoid having to re-deserialize
-// the module. It trusts that the caller didn't make any changes and is
-// kept internal because the layout of the module class may change based
-// on changes across modules, or picking a different compiler version or CRT.
-HRESULT RunInternalValidator(IDxcValidator *pValidator, llvm::Module *pModule,
-                             llvm::Module *pDebugModule, IDxcBlob *pShader,
-                             UINT32 Flags, IDxcOperationResult **ppResult);
 
 static bool ShouldBeCopiedIntoPDB(UINT32 FourCC) {
   switch (FourCC) {
@@ -620,8 +610,7 @@ public:
       // pre-seeding with #line directives. We invoke Preprocess() here
       // first for such case. Then we invoke the compilation process over the
       // preprocessed source code.
-      if (!isPreprocessing && opts.GenSPIRV && opts.DebugInfo &&
-          !opts.SpirvOptions.debugInfoVulkan) {
+      if (!isPreprocessing && opts.GenSPIRV && opts.DebugInfo) {
         // Convert source code encoding
         CComPtr<IDxcBlobUtf8> pOrigUtf8Source;
         IFC(hlsl::DxcGetBlobAsUtf8(pSourceEncoding, m_pMalloc,
@@ -1050,7 +1039,7 @@ public:
 
           dxcutil::AssembleInputs inputs(
               std::move(serializeModule), pOutputBlob, m_pMalloc,
-              SerializeFlags, pOutputStream, opts.GetPDBName(),
+              SerializeFlags, pOutputStream, 0, opts.GetPDBName(),
               &compiler.getDiagnostics(), &ShaderHashContent, pReflectionStream,
               pRootSigStream, pRootSignatureBlob, pPrivateBlob,
               opts.SelectValidator);
@@ -1462,6 +1451,22 @@ public:
 // SPIRV change starts
 #ifdef ENABLE_SPIRV_CODEGEN
     compiler.getLangOpts().SPIRV = Opts.GenSPIRV;
+    llvm::Optional<spv_target_env> spirvTargetEnv =
+        spirv::FeatureManager::stringToSpvEnvironment(
+            Opts.SpirvOptions.targetEnv);
+
+    // If we do not have a valid target environment, the error will be handled
+    // later.
+    if (spirvTargetEnv.hasValue()) {
+      VersionTuple spirvVersion =
+          spirv::FeatureManager::getSpirvVersion(spirvTargetEnv.getValue());
+      compiler.getLangOpts().SpirvMajorVersion = spirvVersion.getMajor();
+      assert(spirvVersion.getMinor().hasValue() &&
+             "There must always be a major and minor version number when "
+             "targeting SPIR-V.");
+      compiler.getLangOpts().SpirvMinorVersion =
+          spirvVersion.getMinor().getValue();
+    }
 #endif
     // SPIRV change ends
 
